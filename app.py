@@ -11,7 +11,7 @@ import logging
 import imaplib
 import email
 from email.header import decode_header
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Optional, Any
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
@@ -27,10 +27,11 @@ CONFIG = {
     'PAYEE_NAME': 'mdnooralam',
     'GMAIL_APP_PASSWORD': 'owjwtlotkfjnsftm',
     'GMAIL_EMAIL': 'nkg166465@gmail.com',
-    'POLL_INTERVAL': 2,  # Reduced from 3 to 2 seconds for faster response
+    'POLL_INTERVAL': 2,  # 2 seconds interval
     'POLL_TIMEOUT': 60,
     'QR_BASE_URL': 'https://upi-qrcode-generater-wroy.vercel.app/qr',
-    'PORT': int(os.getenv('PORT', 5000))
+    'PORT': int(os.getenv('PORT', 5000)),
+    'TIME_WINDOW_MINUTES': 5  # Check only last 5 minutes payments
 }
 
 # ============================================
@@ -173,13 +174,44 @@ def parse_payment_email(body: str) -> Dict[str, Any]:
     if utr_match:
         details['utr'] = utr_match.group(1)
     
-    # ✅ Date
+    # ✅ Date - Extract time from email
     date_match = re.search(
         r'([0-9]{2}:[0-9]{2}\s*(AM|PM)\s*IST,\s*[0-9]{2}\s*[A-Za-z]+\s*[0-9]{4})',
         body, re.IGNORECASE
     )
     if date_match:
         details['date'] = date_match.group(1)
+        
+        # ✅ Parse the date to check if within 5 minutes
+        try:
+            # Extract time from date string
+            time_str = date_match.group(1)
+            # Parse time like "11:54 AM IST, 24 July 2026"
+            time_part = re.search(r'([0-9]{2}:[0-9]{2})\s*(AM|PM)', time_str)
+            if time_part:
+                hour, minute = map(int, time_part.group(1).split(':'))
+                ampm = time_part.group(2)
+                
+                # Convert to 24-hour format
+                if ampm == 'PM' and hour != 12:
+                    hour += 12
+                elif ampm == 'AM' and hour == 12:
+                    hour = 0
+                
+                # Get today's date
+                now = datetime.now()
+                payment_time = datetime(now.year, now.month, now.day, hour, minute)
+                
+                # If payment time is in future (due to AM/PM), adjust
+                if payment_time > now:
+                    payment_time = payment_time - timedelta(days=1)
+                
+                details['payment_datetime'] = payment_time
+                details['time_diff_minutes'] = (now - payment_time).total_seconds() / 60
+                
+                logger.info(f"⏰ Payment at: {payment_time.strftime('%H:%M')}, {details['time_diff_minutes']:.1f} minutes ago")
+        except Exception as e:
+            logger.warning(f"Could not parse date: {e}")
     
     # ✅ Balance
     balance_match = re.search(r'Updated Balance\s*[:]\s*₹([0-9]+(\.[0-9]+)?)', body, re.IGNORECASE)
@@ -198,11 +230,11 @@ def parse_payment_email(body: str) -> Dict[str, Any]:
     
     return details
 
-def search_payment_email_imap(mail, amount: float, start_timestamp: int, check_count: int = 0) -> Optional[Dict[str, Any]]:
-    """Search Gmail inbox for payment confirmation email using IMAP - FAST VERSION"""
+def search_payment_email_imap(mail, amount: float, start_timestamp: int, check_count: int = 0, time_window_minutes: int = 5) -> Optional[Dict[str, Any]]:
+    """Search Gmail inbox for payment confirmation email - ONLY LAST 5 MINUTES"""
     try:
         date_str = datetime.fromtimestamp(start_timestamp).strftime('%d-%b-%Y')
-        logger.info(f"🔍 Searching IMAP (Attempt {check_count})")
+        logger.info(f"🔍 Searching IMAP (Attempt {check_count}) - Last {time_window_minutes} minutes only")
         
         # ✅ Search only emails from today
         result, data = mail.search(None, 'ALL')
@@ -217,26 +249,10 @@ def search_payment_email_imap(mail, amount: float, start_timestamp: int, check_c
         logger.info(f"📬 Found {len(email_ids)} emails total")
         
         # ✅ Check ONLY the most recent emails for speed
-        # Increased from 50 to 30 for faster checking
         for msg_id in email_ids[-30:]:
             msg_id_str = msg_id.decode('utf-8') if isinstance(msg_id, bytes) else str(msg_id)
             
             try:
-                # ✅ Get email date to check if it's recent
-                result, data = mail.fetch(msg_id, '(BODY.PEEK[HEADER.FIELDS (DATE)])')
-                if result == 'OK':
-                    header_data = data[0][1].decode('utf-8', errors='ignore')
-                    date_match = re.search(r'Date:\s*(.+)', header_data, re.IGNORECASE)
-                    if date_match:
-                        try:
-                            email_date = email.utils.parsedate_to_datetime(date_match.group(1))
-                            # ✅ Only process emails from last 2 hours
-                            time_diff = (datetime.now(email_date.tzinfo) - email_date).total_seconds() if email_date.tzinfo else (datetime.now() - email_date).total_seconds()
-                            if time_diff > 7200:  # 2 hours
-                                continue
-                        except:
-                            pass
-                
                 body = get_email_body_from_imap(mail, msg_id_str)
                 
                 if not body:
@@ -244,6 +260,19 @@ def search_payment_email_imap(mail, amount: float, start_timestamp: int, check_c
                 
                 # ✅ Parse payment details
                 payment_details = parse_payment_email(body)
+                
+                # ✅ Check if payment is within time window
+                payment_datetime = payment_details.get('payment_datetime')
+                if payment_datetime:
+                    now = datetime.now()
+                    time_diff = (now - payment_datetime).total_seconds() / 60
+                    
+                    # ❌ Skip if payment is older than 5 minutes
+                    if time_diff > time_window_minutes:
+                        logger.info(f"⏰ Payment {time_diff:.1f} minutes old - Skipping (older than {time_window_minutes} minutes)")
+                        continue
+                    else:
+                        logger.info(f"✅ Payment is {time_diff:.1f} minutes old - Within window")
                 
                 found_amount = payment_details.get('amount')
                 
@@ -280,12 +309,7 @@ def search_payment_email_imap(mail, amount: float, start_timestamp: int, check_c
 
 @app.route('/change-credentials', methods=['POST'])
 def change_credentials():
-    """
-    Change Gmail email and/or password
-    Format: /change-credentials?email=newemail@gmail.com&password=16digitpassword
-    OR JSON body: {"email": "newemail@gmail.com", "password": "16digitpassword"}
-    """
-    # Get parameters from query string or JSON body
+    """Change Gmail email and/or password"""
     data = request.get_json() if request.is_json else request.args.to_dict()
     
     if not data:
@@ -297,28 +321,24 @@ def change_credentials():
     new_email = data.get('email')
     new_password = data.get('password')
     
-    # Validate at least one credential is provided
     if not new_email and not new_password:
         return jsonify({
             'status': 'error',
             'message': 'At least one of email or password is required'
         }), 400
     
-    # Validate password if provided
     if new_password and len(new_password) != 16:
         return jsonify({
             'status': 'error',
             'message': 'Password must be exactly 16 characters'
         }), 400
     
-    # Validate email if provided
     if new_email and not re.match(r'^[a-zA-Z0-9._%+-]+@gmail\.com$', new_email):
         return jsonify({
             'status': 'error',
             'message': 'Email must be a valid Gmail address (ending with @gmail.com)'
         }), 400
     
-    # Test credentials before saving
     test_email = new_email or CONFIG['GMAIL_EMAIL']
     test_password = new_password or CONFIG['GMAIL_APP_PASSWORD']
     
@@ -333,7 +353,6 @@ def change_credentials():
             'message': f'Invalid credentials: {str(e)}'
         }), 400
     
-    # Update configuration
     old_email = CONFIG['GMAIL_EMAIL']
     old_password = CONFIG['GMAIL_APP_PASSWORD']
     
@@ -342,7 +361,6 @@ def change_credentials():
     if new_password:
         CONFIG['GMAIL_APP_PASSWORD'] = new_password
     
-    # Update .env file
     try:
         with open('.env', 'r') as f:
             lines = f.readlines()
@@ -359,7 +377,6 @@ def change_credentials():
         logger.info("✅ Credentials updated in .env file")
     except Exception as e:
         logger.error(f"Error updating .env: {e}")
-        # Revert changes
         CONFIG['GMAIL_EMAIL'] = old_email
         CONFIG['GMAIL_APP_PASSWORD'] = old_password
         return jsonify({
@@ -381,7 +398,6 @@ def change_credentials():
 @app.route('/change-password', methods=['POST'])
 def change_password():
     """Change Gmail app password - New 16 digit password"""
-    # Get password from query string or JSON
     data = request.get_json() if request.is_json else request.args.to_dict()
     
     if not data:
@@ -397,14 +413,12 @@ def change_password():
             'message': 'Password is required'
         }), 400
     
-    # ✅ Validate password length
     if len(new_password) != 16:
         return jsonify({
             'status': 'error',
             'message': 'Password must be exactly 16 characters'
         }), 400
     
-    # ✅ Test the new password before saving
     try:
         test_mail = imaplib.IMAP4_SSL('imap.gmail.com')
         test_mail.login(CONFIG['GMAIL_EMAIL'], new_password)
@@ -416,11 +430,9 @@ def change_password():
             'message': f'Invalid password: {str(e)}'
         }), 400
     
-    # ✅ Update password
     old_password = CONFIG['GMAIL_APP_PASSWORD']
     CONFIG['GMAIL_APP_PASSWORD'] = new_password
     
-    # ✅ Update .env file
     try:
         with open('.env', 'r') as f:
             lines = f.readlines()
@@ -435,7 +447,6 @@ def change_password():
         logger.info("✅ Password updated in .env file")
     except Exception as e:
         logger.error(f"Error updating .env: {e}")
-        # Revert password
         CONFIG['GMAIL_APP_PASSWORD'] = old_password
         return jsonify({
             'status': 'error',
@@ -452,7 +463,6 @@ def change_password():
 @app.route('/change-email', methods=['POST'])
 def change_email():
     """Change Gmail email address"""
-    # Get email from query string or JSON
     data = request.get_json() if request.is_json else request.args.to_dict()
     
     if not data:
@@ -468,14 +478,12 @@ def change_email():
             'message': 'Email is required'
         }), 400
     
-    # ✅ Validate email format
     if not re.match(r'^[a-zA-Z0-9._%+-]+@gmail\.com$', new_email):
         return jsonify({
             'status': 'error',
             'message': 'Email must be a valid Gmail address (ending with @gmail.com)'
         }), 400
     
-    # ✅ Test the new email with current password
     try:
         test_mail = imaplib.IMAP4_SSL('imap.gmail.com')
         test_mail.login(new_email, CONFIG['GMAIL_APP_PASSWORD'])
@@ -487,11 +495,9 @@ def change_email():
             'message': f'Invalid credentials: {str(e)}'
         }), 400
     
-    # ✅ Update email
     old_email = CONFIG['GMAIL_EMAIL']
     CONFIG['GMAIL_EMAIL'] = new_email
     
-    # ✅ Update .env file
     try:
         with open('.env', 'r') as f:
             lines = f.readlines()
@@ -506,7 +512,6 @@ def change_email():
         logger.info(f"✅ Email updated in .env file: {new_email}")
     except Exception as e:
         logger.error(f"Error updating .env: {e}")
-        # Revert email
         CONFIG['GMAIL_EMAIL'] = old_email
         return jsonify({
             'status': 'error',
@@ -552,9 +557,11 @@ def generate_qr():
 
 @app.route('/verify-payment', methods=['POST', 'GET'])
 def verify_payment():
+    """Verify payment - ONLY last 5 minutes payments"""
     if request.method == 'GET':
         amount = request.args.get('amount')
         session_id = request.args.get('session_id')
+        time_window = request.args.get('time_window', 5)  # Default 5 minutes
     else:
         data = request.get_json()
         if not data:
@@ -564,11 +571,12 @@ def verify_payment():
             }), 400
         amount = data.get('amount')
         session_id = data.get('session_id')
+        time_window = data.get('time_window', 5)
     
     if not session_id:
         session_id = f'session_{int(time.time())}_{os.urandom(4).hex()}'
     
-    logger.info(f"[{session_id}] Payment verification started for ₹{amount}")
+    logger.info(f"[{session_id}] Payment verification started for ₹{amount} (Last {time_window} minutes)")
     
     if amount is None:
         return jsonify({
@@ -580,10 +588,11 @@ def verify_payment():
         num_amount = float(amount)
         if num_amount <= 0:
             raise ValueError("Amount must be positive")
+        time_window = int(time_window)
     except ValueError:
         return jsonify({
             'status': 'error',
-            'message': 'Amount must be a positive number'
+            'message': 'Amount must be a positive number and time_window must be integer'
         }), 400
     
     try:
@@ -597,12 +606,20 @@ def verify_payment():
         for attempt in range(1, max_attempts + 1):
             logger.info(f"[{session_id}] Checking attempt {attempt}/{max_attempts}")
             
-            result = search_payment_email_imap(mail, num_amount, start_timestamp, attempt)
+            result = search_payment_email_imap(mail, num_amount, start_timestamp, attempt, time_window)
             
             if result and result.get('amount'):
                 if abs(result.get('amount') - num_amount) < 0.01:
+                    # ✅ Add time window info to response
+                    payment_time = result.get('payment_datetime')
+                    if payment_time:
+                        time_diff = (datetime.now() - payment_time).total_seconds() / 60
+                        result['time_ago_minutes'] = round(time_diff, 1)
+                        result['time_window_minutes'] = time_window
+                        result['within_time_window'] = time_diff <= time_window
+                    
                     result['status'] = 'success'
-                    result['message'] = '✅ Payment verified successfully!'
+                    result['message'] = f'✅ Payment verified successfully! (Received {result.get("time_ago_minutes", 0)} minutes ago)'
                     result['qr_url'] = qr_url
                     result['session_id'] = session_id
                     result['attempt'] = attempt
@@ -620,7 +637,8 @@ def verify_payment():
             'amount': num_amount,
             'qr_url': qr_url,
             'session_id': session_id,
-            'message': '⏰ Payment not received. Please try again.'
+            'time_window_minutes': time_window,
+            'message': f'⏰ Payment not received in last {time_window} minutes. Please try again.'
         })
         
     except Exception as e:
@@ -633,7 +651,9 @@ def verify_payment():
 
 @app.route('/verify-realtime', methods=['GET'])
 def verify_realtime():
+    """Realtime verification - ONLY last 5 minutes payments"""
     amount = request.args.get('amount')
+    time_window = request.args.get('time_window', 5)  # Default 5 minutes
     
     if not amount:
         return jsonify({
@@ -645,32 +665,41 @@ def verify_realtime():
         num_amount = float(amount)
         if num_amount <= 0:
             raise ValueError("Amount must be positive")
+        time_window = int(time_window)
     except ValueError:
         return jsonify({
             'status': 'error',
-            'message': 'Amount must be a positive number'
+            'message': 'Amount must be a positive number and time_window must be integer'
         }), 400
     
     def generate():
         session_id = f'realtime_{int(time.time())}_{os.urandom(4).hex()}'
         start_timestamp = int(time.time())
         attempt = 0
-        max_attempts = 30  # Increased from 20 to 30 (60 seconds with 2s interval)
+        max_attempts = 30  # 60 seconds with 2s interval
         
         try:
             mail = connect_imap()
             
-            yield f"data: {json.dumps({'status': 'checking', 'message': '🔍 Searching for payment...', 'amount': num_amount, 'session_id': session_id})}\n\n"
+            yield f"data: {json.dumps({'status': 'checking', 'message': f'🔍 Searching for payment in last {time_window} minutes...', 'amount': num_amount, 'session_id': session_id, 'time_window': time_window})}\n\n"
             
             while attempt < max_attempts:
                 attempt += 1
                 
-                result = search_payment_email_imap(mail, num_amount, start_timestamp, attempt)
+                result = search_payment_email_imap(mail, num_amount, start_timestamp, attempt, time_window)
                 
                 if result and result.get('amount'):
                     if abs(result.get('amount') - num_amount) < 0.01:
+                        # ✅ Add time window info
+                        payment_time = result.get('payment_datetime')
+                        if payment_time:
+                            time_diff = (datetime.now() - payment_time).total_seconds() / 60
+                            result['time_ago_minutes'] = round(time_diff, 1)
+                            result['time_window_minutes'] = time_window
+                            result['within_time_window'] = time_diff <= time_window
+                        
                         result['status'] = 'success'
-                        result['message'] = '✅ Payment verified successfully!'
+                        result['message'] = f'✅ Payment verified successfully! (Received {result.get("time_ago_minutes", 0)} minutes ago)'
                         result['session_id'] = session_id
                         result['attempt'] = attempt
                         yield f"data: {json.dumps(result)}\n\n"
@@ -680,11 +709,12 @@ def verify_realtime():
                 
                 progress = {
                     'status': 'waiting',
-                    'message': f'⏳ Waiting for payment... Attempt {attempt}/{max_attempts}',
+                    'message': f'⏳ Waiting for payment... Attempt {attempt}/{max_attempts} (Last {time_window} minutes)',
                     'amount': num_amount,
                     'session_id': session_id,
                     'attempt': attempt,
                     'max_attempts': max_attempts,
+                    'time_window': time_window,
                     'progress': round((attempt / max_attempts) * 100, 1)
                 }
                 yield f"data: {json.dumps(progress)}\n\n"
@@ -693,9 +723,10 @@ def verify_realtime():
             if attempt >= max_attempts:
                 timeout_msg = {
                     'status': 'timeout',
-                    'message': '⏰ Payment not received. Please try again.',
+                    'message': f'⏰ Payment not received in last {time_window} minutes. Please try again.',
                     'amount': num_amount,
-                    'session_id': session_id
+                    'session_id': session_id,
+                    'time_window': time_window
                 }
                 yield f"data: {json.dumps(timeout_msg)}\n\n"
                 mail.close()
@@ -718,9 +749,67 @@ def verify_realtime():
         }
     )
 
+@app.route('/verify-last-payment', methods=['GET'])
+def verify_last_payment():
+    """
+    ✅ NEW: Verify the most recent payment within last X minutes
+    Use: /verify-last-payment?amount=1&time_window=5
+    """
+    amount = request.args.get('amount')
+    time_window = request.args.get('time_window', 5)
+    
+    if not amount:
+        return jsonify({
+            'status': 'error',
+            'message': 'Amount is required. Example: ?amount=1&time_window=5'
+        }), 400
+    
+    try:
+        num_amount = float(amount)
+        time_window = int(time_window)
+    except ValueError:
+        return jsonify({
+            'status': 'error',
+            'message': 'Amount must be a number and time_window must be integer'
+        }), 400
+    
+    try:
+        mail = connect_imap()
+        
+        # Search only once - get the most recent payment
+        result = search_payment_email_imap(mail, num_amount, int(time.time()), 1, time_window)
+        
+        mail.close()
+        mail.logout()
+        
+        if result and result.get('amount') and abs(result.get('amount') - num_amount) < 0.01:
+            payment_time = result.get('payment_datetime')
+            if payment_time:
+                time_diff = (datetime.now() - payment_time).total_seconds() / 60
+                result['time_ago_minutes'] = round(time_diff, 1)
+                result['time_window_minutes'] = time_window
+                result['within_time_window'] = time_diff <= time_window
+            
+            result['status'] = 'success'
+            result['message'] = f'✅ Payment verified! (Received {result.get("time_ago_minutes", 0)} minutes ago)'
+            return jsonify(result)
+        else:
+            return jsonify({
+                'status': 'not_found',
+                'message': f'❌ No payment of ₹{num_amount} found in last {time_window} minutes',
+                'amount': num_amount,
+                'time_window': time_window
+            })
+            
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': f'Error: {str(e)}'
+        }), 500
+
 @app.route('/debug-emails', methods=['GET'])
 def debug_emails():
-    """Debug endpoint - Show recent emails"""
+    """Debug endpoint - Show recent emails with time"""
     try:
         mail = connect_imap()
         
@@ -741,33 +830,33 @@ def debug_emails():
             })
         
         emails = []
-        # ✅ Get only last 20 emails
+        now = datetime.now()
+        
         for msg_id in email_ids[-20:]:
             msg_id_str = msg_id.decode('utf-8') if isinstance(msg_id, bytes) else str(msg_id)
             
             try:
-                # ✅ Get email date
-                result, data = mail.fetch(msg_id, '(BODY.PEEK[HEADER.FIELDS (DATE)])')
-                date_str = ""
-                if result == 'OK':
-                    header_data = data[0][1].decode('utf-8', errors='ignore')
-                    date_match = re.search(r'Date:\s*(.+)', header_data, re.IGNORECASE)
-                    if date_match:
-                        date_str = date_match.group(1).strip()
-                
                 body = get_email_body_from_imap(mail, msg_id_str)
                 details = parse_payment_email(body)
                 
+                # Check if within 5 minutes
+                within_5_min = False
+                time_ago = None
+                payment_time = details.get('payment_datetime')
+                if payment_time:
+                    time_ago = (now - payment_time).total_seconds() / 60
+                    within_5_min = time_ago <= 5
+                
                 emails.append({
                     'id': msg_id_str,
-                    'date': date_str,
-                    'body_preview': body[:200] if body else 'No body',
                     'amount_found': details.get('amount'),
                     'transaction_type': details.get('type'),
                     'transaction_id': details.get('transaction_id'),
                     'sender': details.get('sender'),
-                    'purpose': details.get('purpose'),
-                    'balance': details.get('balance')
+                    'payment_time': details.get('date'),
+                    'minutes_ago': round(time_ago, 1) if time_ago is not None else None,
+                    'within_5_minutes': within_5_min,
+                    'body_preview': body[:150] if body else 'No body'
                 })
             except Exception as e:
                 emails.append({
@@ -782,6 +871,8 @@ def debug_emails():
             'status': 'success',
             'gmail': CONFIG['GMAIL_EMAIL'],
             'total_emails': len(emails),
+            'current_time': now.isoformat(),
+            'time_window_minutes': 5,
             'emails': emails
         })
         
@@ -799,60 +890,68 @@ def health_check():
         'gmail': CONFIG['GMAIL_EMAIL'],
         'upi_id': CONFIG['UPI_ID'],
         'auth_method': 'IMAP with App Password',
-        'gmail_configured': True
+        'time_window_minutes': CONFIG['TIME_WINDOW_MINUTES']
     })
 
 @app.route('/', methods=['GET'])
 def index():
     return jsonify({
         'name': 'UPI Auto-Payment Verifier API',
-        'version': '1.2.0',
+        'version': '2.0.0',
         'gmail': CONFIG['GMAIL_EMAIL'],
-        'status': '✅ FULLY WORKING - FAST RESPONSE',
+        'status': '✅ FULLY WORKING - 5 MINUTE WINDOW',
+        'features': {
+            'time_window': f'Only verifies payments from last {CONFIG["TIME_WINDOW_MINUTES"]} minutes',
+            'fast_response': 'Checks every 2 seconds',
+            'real_time': 'SSE streaming for live updates'
+        },
         'endpoints': {
             'change_credentials': {
                 'method': 'POST',
                 'path': '/change-credentials',
                 'params': {'email': 'optional', 'password': 'optional (16 digits)'},
                 'examples': [
-                    '/change-credentials?email=newemail@gmail.com&password=1234567890123456',
-                    '/change-credentials?email=newemail@gmail.com',
-                    '/change-credentials?password=1234567890123456'
+                    '/change-credentials?email=new@gmail.com&password=1234567890123456'
                 ]
             },
             'change_password': {
                 'method': 'POST',
                 'path': '/change-password',
-                'params': {'password': 'required (16 digits)'},
-                'example': '/change-password?password=1234567890123456'
+                'params': {'password': 'required (16 digits)'}
             },
             'change_email': {
                 'method': 'POST',
                 'path': '/change-email',
-                'params': {'email': 'required'},
-                'example': '/change-email?email=newemail@gmail.com'
+                'params': {'email': 'required'}
             },
             'generate_qr': {
                 'method': 'GET',
                 'path': '/generate-qr',
-                'params': {'amount': 'required'},
-                'example': '/generate-qr?amount=1'
+                'params': {'amount': 'required'}
             },
             'verify_payment': {
                 'method': 'POST/GET',
                 'path': '/verify-payment',
-                'params': {'amount': 'required'},
-                'example': '/verify-payment?amount=1'
+                'params': {'amount': 'required', 'time_window': 'optional (default 5)'},
+                'example': '/verify-payment?amount=1&time_window=5'
             },
             'verify_realtime': {
                 'method': 'GET',
                 'path': '/verify-realtime',
-                'params': {'amount': 'required'},
-                'example': '/verify-realtime?amount=1'
+                'params': {'amount': 'required', 'time_window': 'optional (default 5)'},
+                'example': '/verify-realtime?amount=1&time_window=5'
+            },
+            'verify_last_payment': {
+                'method': 'GET',
+                'path': '/verify-last-payment',
+                'params': {'amount': 'required', 'time_window': 'optional (default 5)'},
+                'example': '/verify-last-payment?amount=1&time_window=5',
+                'description': '✅ NEW - Fast one-time check of most recent payment'
             },
             'debug_emails': {
                 'method': 'GET',
-                'path': '/debug-emails'
+                'path': '/debug-emails',
+                'description': 'Shows emails with time stamps'
             },
             'health': {
                 'method': 'GET',
@@ -863,17 +962,19 @@ def index():
 
 if __name__ == '__main__':
     logger.info("=" * 50)
-    logger.info("🚀 UPI PAYMENT VERIFIER API - FAST RESPONSE VERSION")
+    logger.info("🚀 UPI PAYMENT VERIFIER API - 5 MINUTE WINDOW")
     logger.info("=" * 50)
     logger.info(f"📧 Gmail: {CONFIG['GMAIL_EMAIL']}")
     logger.info(f"🔐 App Password: {CONFIG['GMAIL_APP_PASSWORD']}")
     logger.info(f"📱 UPI ID: {CONFIG['UPI_ID']}")
+    logger.info(f"⏰ Time Window: {CONFIG['TIME_WINDOW_MINUTES']} minutes")
     logger.info(f"🌐 Server: http://127.0.0.1:{CONFIG['PORT']}")
     logger.info("=" * 50)
     logger.info("📌 TEST NOW:")
     logger.info(f"  🔍 /debug-emails")
     logger.info(f"  ✅ /verify-payment?amount=1")
     logger.info(f"  ⭐ /verify-realtime?amount=1")
+    logger.info(f"  🚀 /verify-last-payment?amount=1 (FASTEST)")
     logger.info("=" * 50)
     logger.info("🔑 CHANGE CREDENTIALS:")
     logger.info(f"  /change-credentials?email=new@gmail.com&password=1234567890123456")
