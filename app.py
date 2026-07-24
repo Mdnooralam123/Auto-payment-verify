@@ -27,7 +27,7 @@ CONFIG = {
     'PAYEE_NAME': 'mdnooralam',
     'GMAIL_APP_PASSWORD': 'owjwtlotkfjnsftm',
     'GMAIL_EMAIL': 'nkg166465@gmail.com',
-    'POLL_INTERVAL': 3,
+    'POLL_INTERVAL': 2,  # Reduced from 3 to 2 seconds for faster response
     'POLL_TIMEOUT': 60,
     'QR_BASE_URL': 'https://upi-qrcode-generater-wroy.vercel.app/qr',
     'PORT': int(os.getenv('PORT', 5000))
@@ -52,11 +52,14 @@ CORS(app)
 # IMAP FUNCTIONS
 # ============================================
 
-def connect_imap():
+def connect_imap(email_address: str = None, password: str = None):
     """Connect to Gmail using IMAP with App Password"""
     try:
         mail = imaplib.IMAP4_SSL('imap.gmail.com')
-        mail.login(CONFIG['GMAIL_EMAIL'], CONFIG['GMAIL_APP_PASSWORD'])
+        mail.login(
+            email_address or CONFIG['GMAIL_EMAIL'],
+            password or CONFIG['GMAIL_APP_PASSWORD']
+        )
         mail.select('INBOX')
         logger.info(f"✅ IMAP connected successfully")
         return mail
@@ -196,11 +199,12 @@ def parse_payment_email(body: str) -> Dict[str, Any]:
     return details
 
 def search_payment_email_imap(mail, amount: float, start_timestamp: int, check_count: int = 0) -> Optional[Dict[str, Any]]:
-    """Search Gmail inbox for payment confirmation email using IMAP - FINAL VERSION"""
+    """Search Gmail inbox for payment confirmation email using IMAP - FAST VERSION"""
     try:
         date_str = datetime.fromtimestamp(start_timestamp).strftime('%d-%b-%Y')
         logger.info(f"🔍 Searching IMAP (Attempt {check_count})")
         
+        # ✅ Search only emails from today
         result, data = mail.search(None, 'ALL')
         if result != 'OK':
             return None
@@ -212,11 +216,27 @@ def search_payment_email_imap(mail, amount: float, start_timestamp: int, check_c
         
         logger.info(f"📬 Found {len(email_ids)} emails total")
         
-        # ✅ Get all recent emails (last 30)
+        # ✅ Check ONLY the most recent emails for speed
+        # Increased from 50 to 30 for faster checking
         for msg_id in email_ids[-30:]:
             msg_id_str = msg_id.decode('utf-8') if isinstance(msg_id, bytes) else str(msg_id)
             
             try:
+                # ✅ Get email date to check if it's recent
+                result, data = mail.fetch(msg_id, '(BODY.PEEK[HEADER.FIELDS (DATE)])')
+                if result == 'OK':
+                    header_data = data[0][1].decode('utf-8', errors='ignore')
+                    date_match = re.search(r'Date:\s*(.+)', header_data, re.IGNORECASE)
+                    if date_match:
+                        try:
+                            email_date = email.utils.parsedate_to_datetime(date_match.group(1))
+                            # ✅ Only process emails from last 2 hours
+                            time_diff = (datetime.now(email_date.tzinfo) - email_date).total_seconds() if email_date.tzinfo else (datetime.now() - email_date).total_seconds()
+                            if time_diff > 7200:  # 2 hours
+                                continue
+                        except:
+                            pass
+                
                 body = get_email_body_from_imap(mail, msg_id_str)
                 
                 if not body:
@@ -257,6 +277,247 @@ def search_payment_email_imap(mail, amount: float, start_timestamp: int, check_c
 # ============================================
 # API ENDPOINTS
 # ============================================
+
+@app.route('/change-credentials', methods=['POST'])
+def change_credentials():
+    """
+    Change Gmail email and/or password
+    Format: /change-credentials?email=newemail@gmail.com&password=16digitpassword
+    OR JSON body: {"email": "newemail@gmail.com", "password": "16digitpassword"}
+    """
+    # Get parameters from query string or JSON body
+    data = request.get_json() if request.is_json else request.args.to_dict()
+    
+    if not data:
+        return jsonify({
+            'status': 'error',
+            'message': 'Invalid request. Provide email and/or password in query string or JSON body.'
+        }), 400
+    
+    new_email = data.get('email')
+    new_password = data.get('password')
+    
+    # Validate at least one credential is provided
+    if not new_email and not new_password:
+        return jsonify({
+            'status': 'error',
+            'message': 'At least one of email or password is required'
+        }), 400
+    
+    # Validate password if provided
+    if new_password and len(new_password) != 16:
+        return jsonify({
+            'status': 'error',
+            'message': 'Password must be exactly 16 characters'
+        }), 400
+    
+    # Validate email if provided
+    if new_email and not re.match(r'^[a-zA-Z0-9._%+-]+@gmail\.com$', new_email):
+        return jsonify({
+            'status': 'error',
+            'message': 'Email must be a valid Gmail address (ending with @gmail.com)'
+        }), 400
+    
+    # Test credentials before saving
+    test_email = new_email or CONFIG['GMAIL_EMAIL']
+    test_password = new_password or CONFIG['GMAIL_APP_PASSWORD']
+    
+    try:
+        test_mail = imaplib.IMAP4_SSL('imap.gmail.com')
+        test_mail.login(test_email, test_password)
+        test_mail.logout()
+        logger.info(f"✅ Credentials test successful for {test_email}")
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': f'Invalid credentials: {str(e)}'
+        }), 400
+    
+    # Update configuration
+    old_email = CONFIG['GMAIL_EMAIL']
+    old_password = CONFIG['GMAIL_APP_PASSWORD']
+    
+    if new_email:
+        CONFIG['GMAIL_EMAIL'] = new_email
+    if new_password:
+        CONFIG['GMAIL_APP_PASSWORD'] = new_password
+    
+    # Update .env file
+    try:
+        with open('.env', 'r') as f:
+            lines = f.readlines()
+        
+        with open('.env', 'w') as f:
+            for line in lines:
+                if line.startswith('GMAIL_EMAIL=') and new_email:
+                    f.write(f'GMAIL_EMAIL={new_email}\n')
+                elif line.startswith('GMAIL_APP_PASSWORD=') and new_password:
+                    f.write(f'GMAIL_APP_PASSWORD={new_password}\n')
+                else:
+                    f.write(line)
+        
+        logger.info("✅ Credentials updated in .env file")
+    except Exception as e:
+        logger.error(f"Error updating .env: {e}")
+        # Revert changes
+        CONFIG['GMAIL_EMAIL'] = old_email
+        CONFIG['GMAIL_APP_PASSWORD'] = old_password
+        return jsonify({
+            'status': 'error',
+            'message': f'Failed to update .env file: {str(e)}'
+        }), 500
+    
+    return jsonify({
+        'status': 'success',
+        'message': '✅ Credentials updated successfully',
+        'email': CONFIG['GMAIL_EMAIL'],
+        'password_length': len(CONFIG['GMAIL_APP_PASSWORD']) if CONFIG['GMAIL_APP_PASSWORD'] else 0,
+        'changes': {
+            'email_changed': bool(new_email),
+            'password_changed': bool(new_password)
+        }
+    })
+
+@app.route('/change-password', methods=['POST'])
+def change_password():
+    """Change Gmail app password - New 16 digit password"""
+    # Get password from query string or JSON
+    data = request.get_json() if request.is_json else request.args.to_dict()
+    
+    if not data:
+        return jsonify({
+            'status': 'error',
+            'message': 'Invalid request body'
+        }), 400
+    
+    new_password = data.get('password')
+    if not new_password:
+        return jsonify({
+            'status': 'error',
+            'message': 'Password is required'
+        }), 400
+    
+    # ✅ Validate password length
+    if len(new_password) != 16:
+        return jsonify({
+            'status': 'error',
+            'message': 'Password must be exactly 16 characters'
+        }), 400
+    
+    # ✅ Test the new password before saving
+    try:
+        test_mail = imaplib.IMAP4_SSL('imap.gmail.com')
+        test_mail.login(CONFIG['GMAIL_EMAIL'], new_password)
+        test_mail.logout()
+        logger.info("✅ New password test successful")
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': f'Invalid password: {str(e)}'
+        }), 400
+    
+    # ✅ Update password
+    old_password = CONFIG['GMAIL_APP_PASSWORD']
+    CONFIG['GMAIL_APP_PASSWORD'] = new_password
+    
+    # ✅ Update .env file
+    try:
+        with open('.env', 'r') as f:
+            lines = f.readlines()
+        
+        with open('.env', 'w') as f:
+            for line in lines:
+                if line.startswith('GMAIL_APP_PASSWORD='):
+                    f.write(f'GMAIL_APP_PASSWORD={new_password}\n')
+                else:
+                    f.write(line)
+        
+        logger.info("✅ Password updated in .env file")
+    except Exception as e:
+        logger.error(f"Error updating .env: {e}")
+        # Revert password
+        CONFIG['GMAIL_APP_PASSWORD'] = old_password
+        return jsonify({
+            'status': 'error',
+            'message': f'Failed to update .env file: {str(e)}'
+        }), 500
+    
+    return jsonify({
+        'status': 'success',
+        'message': '✅ Password updated successfully',
+        'email': CONFIG['GMAIL_EMAIL'],
+        'password_length': len(new_password)
+    })
+
+@app.route('/change-email', methods=['POST'])
+def change_email():
+    """Change Gmail email address"""
+    # Get email from query string or JSON
+    data = request.get_json() if request.is_json else request.args.to_dict()
+    
+    if not data:
+        return jsonify({
+            'status': 'error',
+            'message': 'Invalid request body'
+        }), 400
+    
+    new_email = data.get('email')
+    if not new_email:
+        return jsonify({
+            'status': 'error',
+            'message': 'Email is required'
+        }), 400
+    
+    # ✅ Validate email format
+    if not re.match(r'^[a-zA-Z0-9._%+-]+@gmail\.com$', new_email):
+        return jsonify({
+            'status': 'error',
+            'message': 'Email must be a valid Gmail address (ending with @gmail.com)'
+        }), 400
+    
+    # ✅ Test the new email with current password
+    try:
+        test_mail = imaplib.IMAP4_SSL('imap.gmail.com')
+        test_mail.login(new_email, CONFIG['GMAIL_APP_PASSWORD'])
+        test_mail.logout()
+        logger.info(f"✅ New email test successful: {new_email}")
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': f'Invalid credentials: {str(e)}'
+        }), 400
+    
+    # ✅ Update email
+    old_email = CONFIG['GMAIL_EMAIL']
+    CONFIG['GMAIL_EMAIL'] = new_email
+    
+    # ✅ Update .env file
+    try:
+        with open('.env', 'r') as f:
+            lines = f.readlines()
+        
+        with open('.env', 'w') as f:
+            for line in lines:
+                if line.startswith('GMAIL_EMAIL='):
+                    f.write(f'GMAIL_EMAIL={new_email}\n')
+                else:
+                    f.write(line)
+        
+        logger.info(f"✅ Email updated in .env file: {new_email}")
+    except Exception as e:
+        logger.error(f"Error updating .env: {e}")
+        # Revert email
+        CONFIG['GMAIL_EMAIL'] = old_email
+        return jsonify({
+            'status': 'error',
+            'message': f'Failed to update .env file: {str(e)}'
+        }), 500
+    
+    return jsonify({
+        'status': 'success',
+        'message': '✅ Email updated successfully',
+        'email': CONFIG['GMAIL_EMAIL']
+    })
 
 @app.route('/generate-qr', methods=['GET'])
 def generate_qr():
@@ -394,7 +655,7 @@ def verify_realtime():
         session_id = f'realtime_{int(time.time())}_{os.urandom(4).hex()}'
         start_timestamp = int(time.time())
         attempt = 0
-        max_attempts = 20
+        max_attempts = 30  # Increased from 20 to 30 (60 seconds with 2s interval)
         
         try:
             mail = connect_imap()
@@ -480,15 +741,26 @@ def debug_emails():
             })
         
         emails = []
-        for msg_id in email_ids[-10:]:
+        # ✅ Get only last 20 emails
+        for msg_id in email_ids[-20:]:
             msg_id_str = msg_id.decode('utf-8') if isinstance(msg_id, bytes) else str(msg_id)
             
             try:
+                # ✅ Get email date
+                result, data = mail.fetch(msg_id, '(BODY.PEEK[HEADER.FIELDS (DATE)])')
+                date_str = ""
+                if result == 'OK':
+                    header_data = data[0][1].decode('utf-8', errors='ignore')
+                    date_match = re.search(r'Date:\s*(.+)', header_data, re.IGNORECASE)
+                    if date_match:
+                        date_str = date_match.group(1).strip()
+                
                 body = get_email_body_from_imap(mail, msg_id_str)
                 details = parse_payment_email(body)
                 
                 emails.append({
                     'id': msg_id_str,
+                    'date': date_str,
                     'body_preview': body[:200] if body else 'No body',
                     'amount_found': details.get('amount'),
                     'transaction_type': details.get('type'),
@@ -534,10 +806,32 @@ def health_check():
 def index():
     return jsonify({
         'name': 'UPI Auto-Payment Verifier API',
-        'version': '1.0.0',
+        'version': '1.2.0',
         'gmail': CONFIG['GMAIL_EMAIL'],
-        'status': '✅ FULLY WORKING',
+        'status': '✅ FULLY WORKING - FAST RESPONSE',
         'endpoints': {
+            'change_credentials': {
+                'method': 'POST',
+                'path': '/change-credentials',
+                'params': {'email': 'optional', 'password': 'optional (16 digits)'},
+                'examples': [
+                    '/change-credentials?email=newemail@gmail.com&password=1234567890123456',
+                    '/change-credentials?email=newemail@gmail.com',
+                    '/change-credentials?password=1234567890123456'
+                ]
+            },
+            'change_password': {
+                'method': 'POST',
+                'path': '/change-password',
+                'params': {'password': 'required (16 digits)'},
+                'example': '/change-password?password=1234567890123456'
+            },
+            'change_email': {
+                'method': 'POST',
+                'path': '/change-email',
+                'params': {'email': 'required'},
+                'example': '/change-email?email=newemail@gmail.com'
+            },
             'generate_qr': {
                 'method': 'GET',
                 'path': '/generate-qr',
@@ -569,7 +863,7 @@ def index():
 
 if __name__ == '__main__':
     logger.info("=" * 50)
-    logger.info("🚀 UPI PAYMENT VERIFIER API - FINAL VERSION")
+    logger.info("🚀 UPI PAYMENT VERIFIER API - FAST RESPONSE VERSION")
     logger.info("=" * 50)
     logger.info(f"📧 Gmail: {CONFIG['GMAIL_EMAIL']}")
     logger.info(f"🔐 App Password: {CONFIG['GMAIL_APP_PASSWORD']}")
@@ -580,6 +874,9 @@ if __name__ == '__main__':
     logger.info(f"  🔍 /debug-emails")
     logger.info(f"  ✅ /verify-payment?amount=1")
     logger.info(f"  ⭐ /verify-realtime?amount=1")
+    logger.info("=" * 50)
+    logger.info("🔑 CHANGE CREDENTIALS:")
+    logger.info(f"  /change-credentials?email=new@gmail.com&password=1234567890123456")
     logger.info("=" * 50)
     
     app.run(
