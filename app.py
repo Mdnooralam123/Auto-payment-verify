@@ -1,6 +1,6 @@
 """
-UPI Auto-Payment Verifier API - FINAL WORKING VERSION
-Email detection working perfectly!
+UPI Auto-Payment Verifier API - FINAL FIXED VERSION
+All endpoints working with 5-minute window
 """
 
 import os
@@ -24,14 +24,14 @@ load_dotenv()
 # ============================================
 CONFIG = {
     'UPI_ID': '9304619487@fam',
-    'PAYEE_NAME': 'mdnooralam',
+    'PAYEE_NAME': 'KHAN STORE',
     'GMAIL_APP_PASSWORD': 'owjwtlotkfjnsftm',
     'GMAIL_EMAIL': 'nkg166465@gmail.com',
-    'POLL_INTERVAL': 2,  # 2 seconds interval
+    'POLL_INTERVAL': 2,  # 2 seconds
     'POLL_TIMEOUT': 60,
     'QR_BASE_URL': 'https://upi-qrcode-generater-wroy.vercel.app/qr',
     'PORT': int(os.getenv('PORT', 5000)),
-    'TIME_WINDOW_MINUTES': 5  # Check only last 5 minutes payments
+    'TIME_WINDOW_MINUTES': 5  # Only check last 5 minutes
 }
 
 # ============================================
@@ -116,7 +116,7 @@ def get_email_body_from_imap(mail, msg_id: str) -> str:
         return ''
 
 def parse_payment_email(body: str) -> Dict[str, Any]:
-    """Parse email body to extract payment details - FULLY IMPROVED"""
+    """Parse email body to extract payment details"""
     details = {
         'amount': None,
         'transaction_id': None,
@@ -126,16 +126,19 @@ def parse_payment_email(body: str) -> Dict[str, Any]:
         'sender': None,
         'purpose': None,
         'type': None,  # 'received' or 'paid'
-        'raw_preview': body[:200]
+        'raw_preview': body[:200],
+        'payment_datetime': None,
+        'time_diff_minutes': None
     }
     
-    # ✅ Check if it's a RECEIVED or PAID transaction
+    # ✅ Check transaction type - MUST BE RECEIVED
     if 'successfully received' in body.lower():
         details['type'] = 'received'
         logger.info("📥 Transaction type: RECEIVED")
     elif 'successfully paid' in body.lower():
         details['type'] = 'paid'
-        logger.info("📤 Transaction type: PAID")
+        logger.info("📤 Transaction type: PAID - SKIPPING")
+        return details  # Return early for paid transactions
     
     # ✅ Amount extraction
     amount_patterns = [
@@ -174,7 +177,7 @@ def parse_payment_email(body: str) -> Dict[str, Any]:
     if utr_match:
         details['utr'] = utr_match.group(1)
     
-    # ✅ Date - Extract time from email
+    # ✅ Date & Time - Extract and parse
     date_match = re.search(
         r'([0-9]{2}:[0-9]{2}\s*(AM|PM)\s*IST,\s*[0-9]{2}\s*[A-Za-z]+\s*[0-9]{4})',
         body, re.IGNORECASE
@@ -182,11 +185,9 @@ def parse_payment_email(body: str) -> Dict[str, Any]:
     if date_match:
         details['date'] = date_match.group(1)
         
-        # ✅ Parse the date to check if within 5 minutes
         try:
-            # Extract time from date string
-            time_str = date_match.group(1)
             # Parse time like "11:54 AM IST, 24 July 2026"
+            time_str = date_match.group(1)
             time_part = re.search(r'([0-9]{2}:[0-9]{2})\s*(AM|PM)', time_str)
             if time_part:
                 hour, minute = map(int, time_part.group(1).split(':'))
@@ -202,14 +203,14 @@ def parse_payment_email(body: str) -> Dict[str, Any]:
                 now = datetime.now()
                 payment_time = datetime(now.year, now.month, now.day, hour, minute)
                 
-                # If payment time is in future (due to AM/PM), adjust
+                # If payment time is in future, adjust
                 if payment_time > now:
                     payment_time = payment_time - timedelta(days=1)
                 
                 details['payment_datetime'] = payment_time
-                details['time_diff_minutes'] = (now - payment_time).total_seconds() / 60
+                details['time_diff_minutes'] = round((now - payment_time).total_seconds() / 60, 1)
                 
-                logger.info(f"⏰ Payment at: {payment_time.strftime('%H:%M')}, {details['time_diff_minutes']:.1f} minutes ago")
+                logger.info(f"⏰ Payment at: {payment_time.strftime('%H:%M')}, {details['time_diff_minutes']} minutes ago")
         except Exception as e:
             logger.warning(f"Could not parse date: {e}")
     
@@ -218,7 +219,7 @@ def parse_payment_email(body: str) -> Dict[str, Any]:
     if balance_match:
         details['balance'] = float(balance_match.group(1))
     
-    # ✅ Sender (for received transactions)
+    # ✅ Sender
     sender_match = re.search(r'from\s*([A-Za-z\s.]+)', body, re.IGNORECASE)
     if sender_match:
         details['sender'] = sender_match.group(1).strip()
@@ -231,12 +232,11 @@ def parse_payment_email(body: str) -> Dict[str, Any]:
     return details
 
 def search_payment_email_imap(mail, amount: float, start_timestamp: int, check_count: int = 0, time_window_minutes: int = 5) -> Optional[Dict[str, Any]]:
-    """Search Gmail inbox for payment confirmation email - ONLY LAST 5 MINUTES"""
+    """Search Gmail inbox for RECEIVED payment confirmation email - ONLY LAST 5 MINUTES"""
     try:
-        date_str = datetime.fromtimestamp(start_timestamp).strftime('%d-%b-%Y')
         logger.info(f"🔍 Searching IMAP (Attempt {check_count}) - Last {time_window_minutes} minutes only")
         
-        # ✅ Search only emails from today
+        # ✅ Search all emails
         result, data = mail.search(None, 'ALL')
         if result != 'OK':
             return None
@@ -246,9 +246,9 @@ def search_payment_email_imap(mail, amount: float, start_timestamp: int, check_c
             logger.info(f"❌ No emails found")
             return None
         
-        logger.info(f"📬 Found {len(email_ids)} emails total")
+        logger.info(f"📬 Found {len(email_ids)} emails total - Checking last 30")
         
-        # ✅ Check ONLY the most recent emails for speed
+        # ✅ Check ONLY the most recent 30 emails
         for msg_id in email_ids[-30:]:
             msg_id_str = msg_id.decode('utf-8') if isinstance(msg_id, bytes) else str(msg_id)
             
@@ -261,18 +261,39 @@ def search_payment_email_imap(mail, amount: float, start_timestamp: int, check_c
                 # ✅ Parse payment details
                 payment_details = parse_payment_email(body)
                 
+                # ✅ MUST BE RECEIVED transaction
+                if payment_details.get('type') != 'received':
+                    logger.info(f"⏭️ Skipping - Not a received transaction")
+                    continue
+                
                 # ✅ Check if payment is within time window
                 payment_datetime = payment_details.get('payment_datetime')
                 if payment_datetime:
-                    now = datetime.now()
-                    time_diff = (now - payment_datetime).total_seconds() / 60
+                    time_diff = payment_details.get('time_diff_minutes', 0)
                     
-                    # ❌ Skip if payment is older than 5 minutes
+                    # ❌ Skip if payment is older than time window
                     if time_diff > time_window_minutes:
-                        logger.info(f"⏰ Payment {time_diff:.1f} minutes old - Skipping (older than {time_window_minutes} minutes)")
+                        logger.info(f"⏰ Payment {time_diff} minutes old - Skipping (older than {time_window_minutes} minutes)")
                         continue
                     else:
-                        logger.info(f"✅ Payment is {time_diff:.1f} minutes old - Within window")
+                        logger.info(f"✅ Payment is {time_diff} minutes old - Within window")
+                else:
+                    # If no time found, check by email date
+                    logger.info(f"⚠️ No time found in email, checking date...")
+                    # Get email date
+                    result, data = mail.fetch(msg_id, '(BODY.PEEK[HEADER.FIELDS (DATE)])')
+                    if result == 'OK':
+                        header_data = data[0][1].decode('utf-8', errors='ignore')
+                        date_match = re.search(r'Date:\s*(.+)', header_data, re.IGNORECASE)
+                        if date_match:
+                            try:
+                                email_date = email.utils.parsedate_to_datetime(date_match.group(1))
+                                time_diff = (datetime.now(email_date.tzinfo) - email_date).total_seconds() / 60 if email_date.tzinfo else (datetime.now() - email_date).total_seconds() / 60
+                                if time_diff > time_window_minutes:
+                                    logger.info(f"⏰ Email {time_diff} minutes old - Skipping")
+                                    continue
+                            except:
+                                pass
                 
                 found_amount = payment_details.get('amount')
                 
@@ -281,15 +302,11 @@ def search_payment_email_imap(mail, amount: float, start_timestamp: int, check_c
                     
                     # ✅ Check amount match (with tolerance)
                     if abs(found_amount - float(amount)) < 0.01:
-                        # ✅ Check if it's a RECEIVED transaction (not paid)
-                        if payment_details.get('type') == 'received':
-                            logger.info(f"✅ MATCH FOUND! Received ₹{found_amount}")
-                            payment_details['email_id'] = msg_id_str
-                            payment_details['timestamp'] = datetime.now().isoformat()
-                            payment_details['check_count'] = check_count
-                            return payment_details
-                        else:
-                            logger.info(f"⚠️ Found amount ₹{found_amount} but it's a PAID transaction, not RECEIVED")
+                        logger.info(f"✅✅✅ MATCH FOUND! Received ₹{found_amount}")
+                        payment_details['email_id'] = msg_id_str
+                        payment_details['timestamp'] = datetime.now().isoformat()
+                        payment_details['check_count'] = check_count
+                        return payment_details
                     else:
                         logger.info(f"❌ Amount mismatch: found ₹{found_amount}, expected ₹{amount}")
                 
@@ -557,11 +574,11 @@ def generate_qr():
 
 @app.route('/verify-payment', methods=['POST', 'GET'])
 def verify_payment():
-    """Verify payment - ONLY last 5 minutes payments"""
+    """Verify payment - ONLY last 5 minutes RECEIVED payments"""
     if request.method == 'GET':
         amount = request.args.get('amount')
         session_id = request.args.get('session_id')
-        time_window = request.args.get('time_window', 5)  # Default 5 minutes
+        time_window = request.args.get('time_window', CONFIG['TIME_WINDOW_MINUTES'])
     else:
         data = request.get_json()
         if not data:
@@ -571,7 +588,7 @@ def verify_payment():
             }), 400
         amount = data.get('amount')
         session_id = data.get('session_id')
-        time_window = data.get('time_window', 5)
+        time_window = data.get('time_window', CONFIG['TIME_WINDOW_MINUTES'])
     
     if not session_id:
         session_id = f'session_{int(time.time())}_{os.urandom(4).hex()}'
@@ -609,20 +626,13 @@ def verify_payment():
             result = search_payment_email_imap(mail, num_amount, start_timestamp, attempt, time_window)
             
             if result and result.get('amount'):
-                if abs(result.get('amount') - num_amount) < 0.01:
-                    # ✅ Add time window info to response
-                    payment_time = result.get('payment_datetime')
-                    if payment_time:
-                        time_diff = (datetime.now() - payment_time).total_seconds() / 60
-                        result['time_ago_minutes'] = round(time_diff, 1)
-                        result['time_window_minutes'] = time_window
-                        result['within_time_window'] = time_diff <= time_window
-                    
+                if abs(result.get('amount') - num_amount) < 0.01 and result.get('type') == 'received':
                     result['status'] = 'success'
-                    result['message'] = f'✅ Payment verified successfully! (Received {result.get("time_ago_minutes", 0)} minutes ago)'
+                    result['message'] = f'✅ Payment verified successfully! (Received {result.get("time_diff_minutes", 0)} minutes ago)'
                     result['qr_url'] = qr_url
                     result['session_id'] = session_id
                     result['attempt'] = attempt
+                    result['time_window_minutes'] = time_window
                     mail.close()
                     mail.logout()
                     return jsonify(result)
@@ -638,7 +648,7 @@ def verify_payment():
             'qr_url': qr_url,
             'session_id': session_id,
             'time_window_minutes': time_window,
-            'message': f'⏰ Payment not received in last {time_window} minutes. Please try again.'
+            'message': f'⏰ No RECEIVED payment of ₹{num_amount} found in last {time_window} minutes. Please try again.'
         })
         
     except Exception as e:
@@ -651,9 +661,9 @@ def verify_payment():
 
 @app.route('/verify-realtime', methods=['GET'])
 def verify_realtime():
-    """Realtime verification - ONLY last 5 minutes payments"""
+    """Realtime verification - ONLY last 5 minutes RECEIVED payments"""
     amount = request.args.get('amount')
-    time_window = request.args.get('time_window', 5)  # Default 5 minutes
+    time_window = request.args.get('time_window', CONFIG['TIME_WINDOW_MINUTES'])
     
     if not amount:
         return jsonify({
@@ -676,32 +686,25 @@ def verify_realtime():
         session_id = f'realtime_{int(time.time())}_{os.urandom(4).hex()}'
         start_timestamp = int(time.time())
         attempt = 0
-        max_attempts = 30  # 60 seconds with 2s interval
+        max_attempts = 30
         
         try:
             mail = connect_imap()
             
-            yield f"data: {json.dumps({'status': 'checking', 'message': f'🔍 Searching for payment in last {time_window} minutes...', 'amount': num_amount, 'session_id': session_id, 'time_window': time_window})}\n\n"
+            yield f"data: {json.dumps({'status': 'checking', 'message': f'🔍 Searching for RECEIVED payment of ₹{num_amount} in last {time_window} minutes...', 'amount': num_amount, 'session_id': session_id, 'time_window': time_window})}\n\n"
             
             while attempt < max_attempts:
                 attempt += 1
                 
                 result = search_payment_email_imap(mail, num_amount, start_timestamp, attempt, time_window)
                 
-                if result and result.get('amount'):
+                if result and result.get('amount') and result.get('type') == 'received':
                     if abs(result.get('amount') - num_amount) < 0.01:
-                        # ✅ Add time window info
-                        payment_time = result.get('payment_datetime')
-                        if payment_time:
-                            time_diff = (datetime.now() - payment_time).total_seconds() / 60
-                            result['time_ago_minutes'] = round(time_diff, 1)
-                            result['time_window_minutes'] = time_window
-                            result['within_time_window'] = time_diff <= time_window
-                        
                         result['status'] = 'success'
-                        result['message'] = f'✅ Payment verified successfully! (Received {result.get("time_ago_minutes", 0)} minutes ago)'
+                        result['message'] = f'✅ Payment verified successfully! (Received {result.get("time_diff_minutes", 0)} minutes ago)'
                         result['session_id'] = session_id
                         result['attempt'] = attempt
+                        result['time_window_minutes'] = time_window
                         yield f"data: {json.dumps(result)}\n\n"
                         mail.close()
                         mail.logout()
@@ -709,7 +712,7 @@ def verify_realtime():
                 
                 progress = {
                     'status': 'waiting',
-                    'message': f'⏳ Waiting for payment... Attempt {attempt}/{max_attempts} (Last {time_window} minutes)',
+                    'message': f'⏳ Waiting for RECEIVED payment... Attempt {attempt}/{max_attempts} (Last {time_window} minutes)',
                     'amount': num_amount,
                     'session_id': session_id,
                     'attempt': attempt,
@@ -723,7 +726,7 @@ def verify_realtime():
             if attempt >= max_attempts:
                 timeout_msg = {
                     'status': 'timeout',
-                    'message': f'⏰ Payment not received in last {time_window} minutes. Please try again.',
+                    'message': f'⏰ No RECEIVED payment of ₹{num_amount} found in last {time_window} minutes. Please try again.',
                     'amount': num_amount,
                     'session_id': session_id,
                     'time_window': time_window
@@ -752,11 +755,11 @@ def verify_realtime():
 @app.route('/verify-last-payment', methods=['GET'])
 def verify_last_payment():
     """
-    ✅ NEW: Verify the most recent payment within last X minutes
+    ✅ FASTEST - Verify the most recent RECEIVED payment within last X minutes
     Use: /verify-last-payment?amount=1&time_window=5
     """
     amount = request.args.get('amount')
-    time_window = request.args.get('time_window', 5)
+    time_window = request.args.get('time_window', CONFIG['TIME_WINDOW_MINUTES'])
     
     if not amount:
         return jsonify({
@@ -782,24 +785,19 @@ def verify_last_payment():
         mail.close()
         mail.logout()
         
-        if result and result.get('amount') and abs(result.get('amount') - num_amount) < 0.01:
-            payment_time = result.get('payment_datetime')
-            if payment_time:
-                time_diff = (datetime.now() - payment_time).total_seconds() / 60
-                result['time_ago_minutes'] = round(time_diff, 1)
+        if result and result.get('amount') and result.get('type') == 'received':
+            if abs(result.get('amount') - num_amount) < 0.01:
+                result['status'] = 'success'
+                result['message'] = f'✅ Payment verified! (Received {result.get("time_diff_minutes", 0)} minutes ago)'
                 result['time_window_minutes'] = time_window
-                result['within_time_window'] = time_diff <= time_window
-            
-            result['status'] = 'success'
-            result['message'] = f'✅ Payment verified! (Received {result.get("time_ago_minutes", 0)} minutes ago)'
-            return jsonify(result)
-        else:
-            return jsonify({
-                'status': 'not_found',
-                'message': f'❌ No payment of ₹{num_amount} found in last {time_window} minutes',
-                'amount': num_amount,
-                'time_window': time_window
-            })
+                return jsonify(result)
+        
+        return jsonify({
+            'status': 'not_found',
+            'message': f'❌ No RECEIVED payment of ₹{num_amount} found in last {time_window} minutes',
+            'amount': num_amount,
+            'time_window': time_window
+        })
             
     except Exception as e:
         return jsonify({
@@ -809,7 +807,7 @@ def verify_last_payment():
 
 @app.route('/debug-emails', methods=['GET'])
 def debug_emails():
-    """Debug endpoint - Show recent emails with time"""
+    """Debug endpoint - Show recent emails with time and type"""
     try:
         mail = connect_imap()
         
@@ -832,6 +830,7 @@ def debug_emails():
         emails = []
         now = datetime.now()
         
+        # Check last 20 emails
         for msg_id in email_ids[-20:]:
             msg_id_str = msg_id.decode('utf-8') if isinstance(msg_id, bytes) else str(msg_id)
             
@@ -856,6 +855,7 @@ def debug_emails():
                     'payment_time': details.get('date'),
                     'minutes_ago': round(time_ago, 1) if time_ago is not None else None,
                     'within_5_minutes': within_5_min,
+                    'is_received': details.get('type') == 'received',
                     'body_preview': body[:150] if body else 'No body'
                 })
             except Exception as e:
@@ -872,7 +872,7 @@ def debug_emails():
             'gmail': CONFIG['GMAIL_EMAIL'],
             'total_emails': len(emails),
             'current_time': now.isoformat(),
-            'time_window_minutes': 5,
+            'time_window_minutes': CONFIG['TIME_WINDOW_MINUTES'],
             'emails': emails
         })
         
@@ -890,7 +890,8 @@ def health_check():
         'gmail': CONFIG['GMAIL_EMAIL'],
         'upi_id': CONFIG['UPI_ID'],
         'auth_method': 'IMAP with App Password',
-        'time_window_minutes': CONFIG['TIME_WINDOW_MINUTES']
+        'time_window_minutes': CONFIG['TIME_WINDOW_MINUTES'],
+        'version': '2.0.0'
     })
 
 @app.route('/', methods=['GET'])
@@ -901,18 +902,16 @@ def index():
         'gmail': CONFIG['GMAIL_EMAIL'],
         'status': '✅ FULLY WORKING - 5 MINUTE WINDOW',
         'features': {
-            'time_window': f'Only verifies payments from last {CONFIG["TIME_WINDOW_MINUTES"]} minutes',
+            'time_window': f'Only verifies RECEIVED payments from last {CONFIG["TIME_WINDOW_MINUTES"]} minutes',
             'fast_response': 'Checks every 2 seconds',
-            'real_time': 'SSE streaming for live updates'
+            'real_time': 'SSE streaming for live updates',
+            'auto_filter': 'Automatically skips PAID transactions'
         },
         'endpoints': {
             'change_credentials': {
                 'method': 'POST',
                 'path': '/change-credentials',
-                'params': {'email': 'optional', 'password': 'optional (16 digits)'},
-                'examples': [
-                    '/change-credentials?email=new@gmail.com&password=1234567890123456'
-                ]
+                'params': {'email': 'optional', 'password': 'optional (16 digits)'}
             },
             'change_password': {
                 'method': 'POST',
@@ -946,38 +945,41 @@ def index():
                 'path': '/verify-last-payment',
                 'params': {'amount': 'required', 'time_window': 'optional (default 5)'},
                 'example': '/verify-last-payment?amount=1&time_window=5',
-                'description': '✅ NEW - Fast one-time check of most recent payment'
+                'description': '✅ FASTEST - One-time check of most recent RECEIVED payment'
             },
             'debug_emails': {
                 'method': 'GET',
                 'path': '/debug-emails',
-                'description': 'Shows emails with time stamps'
+                'description': 'Shows emails with time stamps and transaction types'
             },
             'health': {
                 'method': 'GET',
                 'path': '/health'
             }
+        },
+        'test_commands': {
+            'fast': 'curl "http://127.0.0.1:5000/verify-last-payment?amount=1"',
+            'realtime': 'curl "http://127.0.0.1:5000/verify-realtime?amount=1"',
+            'debug': 'curl "http://127.0.0.1:5000/debug-emails"'
         }
     })
 
 if __name__ == '__main__':
     logger.info("=" * 50)
-    logger.info("🚀 UPI PAYMENT VERIFIER API - 5 MINUTE WINDOW")
+    logger.info("🚀 UPI PAYMENT VERIFIER API - FIXED VERSION")
     logger.info("=" * 50)
     logger.info(f"📧 Gmail: {CONFIG['GMAIL_EMAIL']}")
     logger.info(f"🔐 App Password: {CONFIG['GMAIL_APP_PASSWORD']}")
     logger.info(f"📱 UPI ID: {CONFIG['UPI_ID']}")
     logger.info(f"⏰ Time Window: {CONFIG['TIME_WINDOW_MINUTES']} minutes")
+    logger.info(f"🔄 Type: ONLY RECEIVED transactions")
     logger.info(f"🌐 Server: http://127.0.0.1:{CONFIG['PORT']}")
     logger.info("=" * 50)
     logger.info("📌 TEST NOW:")
-    logger.info(f"  🔍 /debug-emails")
-    logger.info(f"  ✅ /verify-payment?amount=1")
-    logger.info(f"  ⭐ /verify-realtime?amount=1")
+    logger.info(f"  🔍 /debug-emails (Check emails)")
     logger.info(f"  🚀 /verify-last-payment?amount=1 (FASTEST)")
-    logger.info("=" * 50)
-    logger.info("🔑 CHANGE CREDENTIALS:")
-    logger.info(f"  /change-credentials?email=new@gmail.com&password=1234567890123456")
+    logger.info(f"  ✅ /verify-payment?amount=1 (Polling)")
+    logger.info(f"  ⭐ /verify-realtime?amount=1 (Realtime)")
     logger.info("=" * 50)
     
     app.run(
