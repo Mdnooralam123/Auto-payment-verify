@@ -117,7 +117,7 @@ def get_email_body_from_imap(mail, msg_id: str) -> str:
         return ''
 
 def parse_payment_email(body: str) -> Dict[str, Any]:
-    """Parse email body to extract payment details"""
+    """Parse email body to extract payment details - IMPROVED"""
     details = {
         'amount': None,
         'transaction_id': None,
@@ -132,21 +132,33 @@ def parse_payment_email(body: str) -> Dict[str, Any]:
         'time_diff_minutes': None
     }
     
-    if 'successfully received' in body.lower():
+    # 📌 IMPROVED: Better transaction type detection
+    body_lower = body.lower()
+    
+    # Check for received transaction
+    if 'successfully received' in body_lower or 'received' in body_lower:
         details['type'] = 'received'
         logger.info("📥 Transaction type: RECEIVED")
-    elif 'successfully paid' in body.lower():
+    elif 'successfully paid' in body_lower or 'paid to' in body_lower:
         details['type'] = 'paid'
         logger.info("📤 Transaction type: PAID - SKIPPING")
         return details
+    else:
+        # Default to None if can't determine
+        details['type'] = 'unknown'
+        logger.info("❓ Unknown transaction type")
     
+    # 📌 IMPROVED: Better amount extraction with multiple patterns
     amount_patterns = [
-        r'₹([0-9]+(\.[0-9]+)?)',
-        r'Amount\s*[:]\s*₹([0-9]+(\.[0-9]+)?)',
-        r'Rs\.?\s*([0-9]+(\.[0-9]+)?)',
-        r'INR\s*([0-9]+(\.[0-9]+)?)',
-        r'([0-9]+(\.[0-9]+)?)\s*INR',
-        r'([0-9]+(\.[0-9]+)?)\s*Rs\.?',
+        r'₹\s*([0-9]+(?:\.[0-9]+)?)',  # ₹100 or ₹100.00
+        r'Rs\.?\s*([0-9]+(?:\.[0-9]+)?)',  # Rs 100 or Rs.100
+        r'INR\s*([0-9]+(?:\.[0-9]+)?)',  # INR 100
+        r'Amount\s*[:]\s*₹\s*([0-9]+(?:\.[0-9]+)?)',
+        r'Amount\s*[:]\s*Rs\.?\s*([0-9]+(?:\.[0-9]+)?)',
+        r'([0-9]+(?:\.[0-9]+)?)\s*INR',
+        r'([0-9]+(?:\.[0-9]+)?)\s*Rs\.?',
+        r'credited with\s*₹\s*([0-9]+(?:\.[0-9]+)?)',
+        r'debited with\s*₹\s*([0-9]+(?:\.[0-9]+)?)',
     ]
     
     for pattern in amount_patterns:
@@ -156,12 +168,15 @@ def parse_payment_email(body: str) -> Dict[str, Any]:
             logger.info(f"💰 Found amount: ₹{details['amount']}")
             break
     
+    # 📌 IMPROVED: Better transaction ID extraction
     tx_patterns = [
-        r'Transaction ID\s*[:]\s*([A-Z0-9]+)',
-        r'Txn ID\s*[:]\s*([A-Z0-9]+)',
-        r'Transaction\s*ID\s*[:]\s*([A-Z0-9]+)',
-        r'Txn\s*[:]\s*([A-Z0-9]+)',
-        r'with transaction id\s*([A-Z0-9]+)',
+        r'Transaction ID\s*[:]\s*([A-Z0-9]{10,})',
+        r'Txn ID\s*[:]\s*([A-Z0-9]{10,})',
+        r'Txn\s*[:]\s*([A-Z0-9]{10,})',
+        r'Transaction\s*ID\s*[:]\s*([A-Z0-9]{10,})',
+        r'with transaction id\s*([A-Z0-9]{10,})',
+        r'txnid\s*[:]\s*([A-Z0-9]{10,})',
+        r'ID\s*[:]\s*([A-Z0-9]{10,})',
     ]
     for pattern in tx_patterns:
         match = re.search(pattern, body, re.IGNORECASE)
@@ -170,118 +185,202 @@ def parse_payment_email(body: str) -> Dict[str, Any]:
             logger.info(f"📋 Transaction ID: {details['transaction_id']}")
             break
     
-    utr_match = re.search(r'UTR\s*[:]\s*([0-9]+)', body, re.IGNORECASE)
-    if utr_match:
-        details['utr'] = utr_match.group(1)
+    # UTR number (unique for each transaction)
+    utr_patterns = [
+        r'UTR\s*[:]\s*([0-9]{10,})',
+        r'UTR\s*No\s*[:]\s*([0-9]{10,})',
+        r'UTR Number\s*[:]\s*([0-9]{10,})',
+    ]
+    for pattern in utr_patterns:
+        utr_match = re.search(pattern, body, re.IGNORECASE)
+        if utr_match:
+            details['utr'] = utr_match.group(1)
+            logger.info(f"🔢 UTR: {details['utr']}")
+            break
     
-    date_match = re.search(
+    # 📌 IMPROVED: Better date extraction
+    date_patterns = [
         r'([0-9]{2}:[0-9]{2}\s*(AM|PM)\s*IST,\s*[0-9]{2}\s*[A-Za-z]+\s*[0-9]{4})',
-        body, re.IGNORECASE
-    )
-    if date_match:
-        details['date'] = date_match.group(1)
-        
+        r'Date\s*[:]\s*([0-9]{2}/[0-9]{2}/[0-9]{4}\s*[0-9]{2}:[0-9]{2}\s*(AM|PM))',
+        r'dated\s*([0-9]{2}/[0-9]{2}/[0-9]{4}\s*at\s*[0-9]{2}:[0-9]{2}\s*(AM|PM))',
+        r'([0-9]{2}\s*[A-Za-z]+\s*[0-9]{4}\s*at\s*[0-9]{2}:[0-9]{2}\s*(AM|PM))',
+    ]
+    
+    for pattern in date_patterns:
+        match = re.search(pattern, body, re.IGNORECASE)
+        if match:
+            details['date'] = match.group(1)
+            logger.info(f"📅 Date found: {details['date']}")
+            break
+    
+    # Parse datetime from the extracted date string
+    if details['date']:
         try:
-            time_str = date_match.group(1)
-            time_part = re.search(r'([0-9]{2}:[0-9]{2})\s*(AM|PM)', time_str)
-            if time_part:
-                hour, minute = map(int, time_part.group(1).split(':'))
-                ampm = time_part.group(2)
-                
-                if ampm == 'PM' and hour != 12:
-                    hour += 12
-                elif ampm == 'AM' and hour == 12:
-                    hour = 0
-                
-                now = datetime.now()
-                payment_time = datetime(now.year, now.month, now.day, hour, minute)
-                
-                if payment_time > now:
-                    payment_time = payment_time - timedelta(days=1)
-                
-                details['payment_datetime'] = payment_time
-                details['time_diff_minutes'] = round((now - payment_time).total_seconds() / 60, 1)
-                
-                logger.info(f"⏰ Payment at: {payment_time.strftime('%H:%M')}, {details['time_diff_minutes']} minutes ago")
+            date_str = details['date']
+            # Try different date formats
+            try:
+                from dateutil import parser
+                dt = parser.parse(date_str, fuzzy=True)
+                details['payment_datetime'] = dt
+            except:
+                # Try manual parsing for common format
+                time_match = re.search(r'([0-9]{1,2}):([0-9]{2})\s*(AM|PM)', date_str, re.IGNORECASE)
+                if time_match:
+                    hour = int(time_match.group(1))
+                    minute = int(time_match.group(2))
+                    ampm = time_match.group(3).upper()
+                    
+                    if ampm == 'PM' and hour != 12:
+                        hour += 12
+                    elif ampm == 'AM' and hour == 12:
+                        hour = 0
+                    
+                    now = datetime.now()
+                    payment_time = datetime(now.year, now.month, now.day, hour, minute)
+                    
+                    # If payment time is in future, it was yesterday
+                    if payment_time > now:
+                        payment_time = payment_time - timedelta(days=1)
+                    
+                    details['payment_datetime'] = payment_time
+                    details['time_diff_minutes'] = round((now - payment_time).total_seconds() / 60, 1)
+                    logger.info(f"⏰ Payment at: {payment_time.strftime('%H:%M')}, {details['time_diff_minutes']} minutes ago")
         except Exception as e:
             logger.warning(f"Could not parse date: {e}")
     
-    balance_match = re.search(r'Updated Balance\s*[:]\s*₹([0-9]+(\.[0-9]+)?)', body, re.IGNORECASE)
+    # Balance
+    balance_match = re.search(r'Updated Balance\s*[:]\s*₹\s*([0-9]+(?:\.[0-9]+)?)', body, re.IGNORECASE)
     if balance_match:
         details['balance'] = float(balance_match.group(1))
     
+    # Sender
     sender_match = re.search(r'from\s*([A-Za-z\s.]+)', body, re.IGNORECASE)
     if sender_match:
-        details['sender'] = sender_match.group(1).strip()
+        details['sender'] = sender_match.group(1).strip()[:50]  # Limit length
     
+    # Purpose
     purpose_match = re.search(r'Purpose\s*[:]\s*(.+)', body, re.IGNORECASE)
     if purpose_match:
-        details['purpose'] = purpose_match.group(1).strip()
+        details['purpose'] = purpose_match.group(1).strip()[:100]  # Limit length
     
     return details
 
 def search_payment_email_imap(mail, amount: float, start_timestamp: int, check_count: int = 0, time_window_minutes: int = 5) -> Optional[Dict[str, Any]]:
-    """ULTRA FAST - Search ONLY the most recent emails"""
+    """ULTRA FAST - Search ONLY the most recent emails within time window"""
     try:
         logger.info(f"⚡ ULTRA FAST Search (Attempt {check_count}) - Last {time_window_minutes} minutes")
         
-        result, data = mail.search(None, 'ALL')
+        # 📌 CRITICAL FIX: Sirf last 5 minutes ki emails fetch karo
+        # Calculate date for search
+        since_date = (datetime.now() - timedelta(minutes=time_window_minutes)).strftime("%d-%b-%Y")
+        
+        # Search emails from today
+        result, data = mail.search(None, f'SINCE "{since_date}"')
         if result != 'OK':
-            return None
+            logger.warning("⚠️ Search failed, trying ALL")
+            result, data = mail.search(None, 'ALL')
+            if result != 'OK':
+                return None
         
         email_ids = data[0].split()
         if not email_ids:
-            logger.info(f"❌ No emails found")
+            logger.info(f"❌ No emails found in last {time_window_minutes} minutes")
             return None
         
-        # ⚡ Check ONLY the most recent 10 emails for speed
-        for msg_id in email_ids[-10:]:
+        # ⚡ Check ALL recent emails (not just last 10) for accuracy
+        # But limit to last 50 for performance
+        recent_ids = email_ids[-50:] if len(email_ids) > 50 else email_ids
+        
+        logger.info(f"📧 Checking {len(recent_ids)} recent emails")
+        
+        # Create a set to track processed email IDs to avoid duplicates
+        processed_ids = set()
+        
+        for msg_id in reversed(recent_ids):  # Check newest first
             msg_id_str = msg_id.decode('utf-8') if isinstance(msg_id, bytes) else str(msg_id)
             
+            if msg_id_str in processed_ids:
+                continue
+            processed_ids.add(msg_id_str)
+            
             try:
+                # Get email date first to filter quickly
+                result, data = mail.fetch(msg_id, '(BODY.PEEK[HEADER.FIELDS (DATE)])')
+                if result == 'OK':
+                    header_data = data[0][1].decode('utf-8', errors='ignore')
+                    date_match = re.search(r'Date:\s*(.+)', header_data, re.IGNORECASE)
+                    if date_match:
+                        try:
+                            email_date = email.utils.parsedate_to_datetime(date_match.group(1))
+                            if email_date.tzinfo:
+                                # Make timezone aware comparison
+                                now = datetime.now(email_date.tzinfo)
+                            else:
+                                now = datetime.now()
+                            time_diff = (now - email_date).total_seconds() / 60
+                            
+                            # Skip if email is older than time window
+                            if time_diff > time_window_minutes:
+                                logger.debug(f"⏭️ Skipping old email: {time_diff:.1f} minutes old")
+                                continue
+                        except Exception as e:
+                            logger.debug(f"Date parse error: {e}")
+                
+                # Get full email body
                 body = get_email_body_from_imap(mail, msg_id_str)
                 
                 if not body:
                     continue
                 
+                # Parse payment details
                 payment_details = parse_payment_email(body)
                 
+                # Skip if not received transaction
                 if payment_details.get('type') != 'received':
                     continue
                 
-                payment_datetime = payment_details.get('payment_datetime')
-                if payment_datetime:
-                    time_diff = payment_details.get('time_diff_minutes', 0)
-                    
-                    if time_diff > time_window_minutes:
-                        continue
-                    else:
-                        logger.info(f"✅ Payment is {time_diff} minutes old - Within window")
-                else:
-                    result, data = mail.fetch(msg_id, '(BODY.PEEK[HEADER.FIELDS (DATE)])')
-                    if result == 'OK':
-                        header_data = data[0][1].decode('utf-8', errors='ignore')
-                        date_match = re.search(r'Date:\s*(.+)', header_data, re.IGNORECASE)
-                        if date_match:
-                            try:
-                                email_date = email.utils.parsedate_to_datetime(date_match.group(1))
-                                time_diff = (datetime.now(email_date.tzinfo) - email_date).total_seconds() / 60 if email_date.tzinfo else (datetime.now() - email_date).total_seconds() / 60
-                                if time_diff > time_window_minutes:
-                                    continue
-                            except:
-                                pass
-                
                 found_amount = payment_details.get('amount')
                 
-                if found_amount:
+                if found_amount is not None:
                     logger.info(f"💰 Found: ₹{found_amount}, Expected: ₹{amount}")
                     
+                    # Amount matching with tolerance
                     if abs(found_amount - float(amount)) < 0.01:
-                        logger.info(f"✅✅✅ MATCH FOUND! Received ₹{found_amount}")
-                        payment_details['email_id'] = msg_id_str
-                        payment_details['timestamp'] = datetime.now().isoformat()
-                        payment_details['check_count'] = check_count
-                        return payment_details
+                        # Check time difference
+                        payment_datetime = payment_details.get('payment_datetime')
+                        if payment_datetime:
+                            time_diff = payment_details.get('time_diff_minutes', 0)
+                            if time_diff <= time_window_minutes:
+                                logger.info(f"✅✅✅ MATCH FOUND! Received ₹{found_amount} ({time_diff:.1f} minutes ago)")
+                                payment_details['email_id'] = msg_id_str
+                                payment_details['timestamp'] = datetime.now().isoformat()
+                                payment_details['check_count'] = check_count
+                                return payment_details
+                            else:
+                                logger.info(f"⏭️ Payment is {time_diff:.1f} minutes old, outside {time_window_minutes} min window")
+                        else:
+                            # If no payment datetime, check email date
+                            try:
+                                result, data = mail.fetch(msg_id, '(BODY.PEEK[HEADER.FIELDS (DATE)])')
+                                if result == 'OK':
+                                    header_data = data[0][1].decode('utf-8', errors='ignore')
+                                    date_match = re.search(r'Date:\s*(.+)', header_data, re.IGNORECASE)
+                                    if date_match:
+                                        email_date = email.utils.parsedate_to_datetime(date_match.group(1))
+                                        if email_date.tzinfo:
+                                            now = datetime.now(email_date.tzinfo)
+                                        else:
+                                            now = datetime.now()
+                                        time_diff = (now - email_date).total_seconds() / 60
+                                        if time_diff <= time_window_minutes:
+                                            logger.info(f"✅✅✅ MATCH FOUND! Received ₹{found_amount}")
+                                            payment_details['email_id'] = msg_id_str
+                                            payment_details['timestamp'] = datetime.now().isoformat()
+                                            payment_details['check_count'] = check_count
+                                            payment_details['time_diff_minutes'] = round(time_diff, 1)
+                                            return payment_details
+                            except Exception as e:
+                                logger.warning(f"Could not verify email date: {e}")
                     else:
                         logger.info(f"❌ Amount mismatch: found ₹{found_amount}, expected ₹{amount}")
                 
@@ -372,11 +471,30 @@ def verify_payment():
             'message': 'Amount must be a positive number and time_window must be integer'
         }), 400
     
+    qr_url = f"https://upi-qrcode-generater-wroy.vercel.app/qr/9304619487@fam/{num_amount}/KHAN%20STORE"
+    
+    # ⚡ FAST RESPONSE: Pehle check karo ki email already available hai
+    try:
+        mail = connect_imap()
+        immediate_result = search_payment_email_imap(mail, num_amount, int(time.time()), 0, time_window)
+        if immediate_result and immediate_result.get('amount'):
+            if abs(immediate_result.get('amount') - num_amount) < 0.01:
+                immediate_result['status'] = 'success'
+                immediate_result['message'] = f'✅ Payment verified instantly!'
+                immediate_result['qr_url'] = qr_url
+                immediate_result['session_id'] = session_id
+                immediate_result['response_time'] = 'Instant'
+                mail.close()
+                mail.logout()
+                return jsonify(immediate_result)
+        mail.close()
+        mail.logout()
+    except Exception as e:
+        logger.warning(f"Immediate check failed: {e}")
+    
     try:
         mail = connect_imap()
         start_timestamp = int(time.time())
-        
-        qr_url = f"https://upi-qrcode-generater-wroy.vercel.app/qr/9304619487@fam/{num_amount}/KHAN%20STORE"
         
         max_attempts = CONFIG['POLL_TIMEOUT'] // CONFIG['POLL_INTERVAL']
         
