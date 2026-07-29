@@ -32,7 +32,7 @@ CONFIG = {
     'POLL_TIMEOUT': 60,
     'QR_BASE_URL': 'https://upi-qrcode-generater-wroy.vercel.app/qr',
     'PORT': int(os.getenv('PORT', 5000)),
-    'TIME_WINDOW_MINUTES': 5
+    'TIME_WINDOW_MINUTES': 30  # 🔥 FIX: 30 minutes tak check karega
 }
 
 # ============================================
@@ -117,7 +117,7 @@ def get_email_body_from_imap(mail, msg_id: str) -> str:
         return ''
 
 def parse_payment_email(body: str) -> Dict[str, Any]:
-    """Parse email body to extract payment details - IMPROVED"""
+    """Parse email body to extract payment details - IMPROVED for FamPay"""
     details = {
         'amount': None,
         'transaction_id': None,
@@ -132,14 +132,14 @@ def parse_payment_email(body: str) -> Dict[str, Any]:
         'time_diff_minutes': None
     }
     
-    # 📌 IMPROVED: Better transaction type detection
+    # 📌 IMPROVED: Better transaction type detection for FamPay
     body_lower = body.lower()
     
-    # Check for received transaction
-    if 'successfully received' in body_lower or 'received' in body_lower:
+    # Check for received transaction - FamPay specific
+    if 'successfully received' in body_lower or 'received' in body_lower or 'you have successfully r' in body_lower:
         details['type'] = 'received'
         logger.info("📥 Transaction type: RECEIVED")
-    elif 'successfully paid' in body_lower or 'paid to' in body_lower:
+    elif 'successfully paid' in body_lower or 'paid to' in body_lower or 'debited' in body_lower:
         details['type'] = 'paid'
         logger.info("📤 Transaction type: PAID - SKIPPING")
         return details
@@ -159,6 +159,8 @@ def parse_payment_email(body: str) -> Dict[str, Any]:
         r'([0-9]+(?:\.[0-9]+)?)\s*Rs\.?',
         r'credited with\s*₹\s*([0-9]+(?:\.[0-9]+)?)',
         r'debited with\s*₹\s*([0-9]+(?:\.[0-9]+)?)',
+        r'You received\s*₹\s*([0-9]+(?:\.[0-9]+)?)',  # FamPay specific
+        r'received\s*₹\s*([0-9]+(?:\.[0-9]+)?)',
     ]
     
     for pattern in amount_patterns:
@@ -204,6 +206,7 @@ def parse_payment_email(body: str) -> Dict[str, Any]:
         r'Date\s*[:]\s*([0-9]{2}/[0-9]{2}/[0-9]{4}\s*[0-9]{2}:[0-9]{2}\s*(AM|PM))',
         r'dated\s*([0-9]{2}/[0-9]{2}/[0-9]{4}\s*at\s*[0-9]{2}:[0-9]{2}\s*(AM|PM))',
         r'([0-9]{2}\s*[A-Za-z]+\s*[0-9]{4}\s*at\s*[0-9]{2}:[0-9]{2}\s*(AM|PM))',
+        r'([0-9]{1,2}:[0-9]{2}\s*(AM|PM))',  # Just time
     ]
     
     for pattern in date_patterns:
@@ -217,34 +220,28 @@ def parse_payment_email(body: str) -> Dict[str, Any]:
     if details['date']:
         try:
             date_str = details['date']
-            # Try different date formats
-            try:
-                from dateutil import parser
-                dt = parser.parse(date_str, fuzzy=True)
-                details['payment_datetime'] = dt
-            except:
-                # Try manual parsing for common format
-                time_match = re.search(r'([0-9]{1,2}):([0-9]{2})\s*(AM|PM)', date_str, re.IGNORECASE)
-                if time_match:
-                    hour = int(time_match.group(1))
-                    minute = int(time_match.group(2))
-                    ampm = time_match.group(3).upper()
-                    
-                    if ampm == 'PM' and hour != 12:
-                        hour += 12
-                    elif ampm == 'AM' and hour == 12:
-                        hour = 0
-                    
-                    now = datetime.now()
-                    payment_time = datetime(now.year, now.month, now.day, hour, minute)
-                    
-                    # If payment time is in future, it was yesterday
-                    if payment_time > now:
-                        payment_time = payment_time - timedelta(days=1)
-                    
-                    details['payment_datetime'] = payment_time
-                    details['time_diff_minutes'] = round((now - payment_time).total_seconds() / 60, 1)
-                    logger.info(f"⏰ Payment at: {payment_time.strftime('%H:%M')}, {details['time_diff_minutes']} minutes ago")
+            # Try manual parsing for common format
+            time_match = re.search(r'([0-9]{1,2}):([0-9]{2})\s*(AM|PM)', date_str, re.IGNORECASE)
+            if time_match:
+                hour = int(time_match.group(1))
+                minute = int(time_match.group(2))
+                ampm = time_match.group(3).upper()
+                
+                if ampm == 'PM' and hour != 12:
+                    hour += 12
+                elif ampm == 'AM' and hour == 12:
+                    hour = 0
+                
+                now = datetime.now()
+                payment_time = datetime(now.year, now.month, now.day, hour, minute)
+                
+                # If payment time is in future, it was yesterday
+                if payment_time > now:
+                    payment_time = payment_time - timedelta(days=1)
+                
+                details['payment_datetime'] = payment_time
+                details['time_diff_minutes'] = round((now - payment_time).total_seconds() / 60, 1)
+                logger.info(f"⏰ Payment at: {payment_time.strftime('%H:%M')}, {details['time_diff_minutes']} minutes ago")
         except Exception as e:
             logger.warning(f"Could not parse date: {e}")
     
@@ -265,12 +262,14 @@ def parse_payment_email(body: str) -> Dict[str, Any]:
     
     return details
 
-def search_payment_email_imap(mail, amount: float, start_timestamp: int, check_count: int = 0, time_window_minutes: int = 5) -> Optional[Dict[str, Any]]:
+def search_payment_email_imap(mail, amount: float, start_timestamp: int, check_count: int = 0, time_window_minutes: int = 30) -> Optional[Dict[str, Any]]:
     """ULTRA FAST - Search ONLY the most recent emails within time window"""
     try:
+        # 🔥 FIX: Ensure time_window_minutes is integer
+        time_window_minutes = int(time_window_minutes)
         logger.info(f"⚡ ULTRA FAST Search (Attempt {check_count}) - Last {time_window_minutes} minutes")
         
-        # 📌 CRITICAL FIX: Sirf last 5 minutes ki emails fetch karo
+        # 📌 CRITICAL FIX: Sirf last X minutes ki emails fetch karo
         # Calculate date for search
         since_date = (datetime.now() - timedelta(minutes=time_window_minutes)).strftime("%d-%b-%Y")
         
@@ -287,9 +286,8 @@ def search_payment_email_imap(mail, amount: float, start_timestamp: int, check_c
             logger.info(f"❌ No emails found in last {time_window_minutes} minutes")
             return None
         
-        # ⚡ Check ALL recent emails (not just last 10) for accuracy
-        # But limit to last 50 for performance
-        recent_ids = email_ids[-50:] if len(email_ids) > 50 else email_ids
+        # ⚡ Check ALL recent emails for accuracy
+        recent_ids = email_ids[-100:] if len(email_ids) > 100 else email_ids  # 🔥 Increased to 100
         
         logger.info(f"📧 Checking {len(recent_ids)} recent emails")
         
@@ -337,6 +335,7 @@ def search_payment_email_imap(mail, amount: float, start_timestamp: int, check_c
                 
                 # Skip if not received transaction
                 if payment_details.get('type') != 'received':
+                    logger.debug(f"⏭️ Skipping non-received transaction: {payment_details.get('type')}")
                     continue
                 
                 found_amount = payment_details.get('amount')
@@ -464,11 +463,12 @@ def verify_payment():
         num_amount = float(amount)
         if num_amount <= 0:
             raise ValueError("Amount must be positive")
-        time_window = int(time_window)
-    except ValueError:
+        # 🔥 FIX: Ensure time_window is integer
+        time_window = int(time_window) if time_window else CONFIG['TIME_WINDOW_MINUTES']
+    except ValueError as e:
         return jsonify({
             'status': 'error',
-            'message': 'Amount must be a positive number and time_window must be integer'
+            'message': f'Invalid input: {str(e)}'
         }), 400
     
     qr_url = f"https://upi-qrcode-generater-wroy.vercel.app/qr/9304619487@fam/{num_amount}/KHAN%20STORE"
@@ -480,10 +480,11 @@ def verify_payment():
         if immediate_result and immediate_result.get('amount'):
             if abs(immediate_result.get('amount') - num_amount) < 0.01:
                 immediate_result['status'] = 'success'
-                immediate_result['message'] = f'✅ Payment verified instantly!'
+                immediate_result['message'] = f'✅ Payment verified instantly! (Received {immediate_result.get("time_diff_minutes", 0)} minutes ago)'
                 immediate_result['qr_url'] = qr_url
                 immediate_result['session_id'] = session_id
                 immediate_result['response_time'] = 'Instant'
+                immediate_result['time_window_minutes'] = time_window
                 mail.close()
                 mail.logout()
                 return jsonify(immediate_result)
@@ -522,7 +523,7 @@ def verify_payment():
         mail.logout()
         
         return jsonify({
-            'status': 'pending',
+            'status': 'not_found',
             'amount': num_amount,
             'qr_url': qr_url,
             'session_id': session_id,
@@ -554,11 +555,12 @@ def verify_realtime():
         num_amount = float(amount)
         if num_amount <= 0:
             raise ValueError("Amount must be positive")
-        time_window = int(time_window)
-    except ValueError:
+        # 🔥 FIX: Ensure time_window is integer
+        time_window = int(time_window) if time_window else CONFIG['TIME_WINDOW_MINUTES']
+    except ValueError as e:
         return jsonify({
             'status': 'error',
-            'message': 'Amount must be a positive number and time_window must be integer'
+            'message': f'Invalid input: {str(e)}'
         }), 400
     
     def generate():
@@ -641,16 +643,17 @@ def verify_last_payment():
     if not amount:
         return jsonify({
             'status': 'error',
-            'message': 'Amount is required. Example: ?amount=1&time_window=5'
+            'message': 'Amount is required. Example: ?amount=1&time_window=30'
         }), 400
     
     try:
         num_amount = float(amount)
-        time_window = int(time_window)
-    except ValueError:
+        # 🔥 FIX: Ensure time_window is integer
+        time_window = int(time_window) if time_window else CONFIG['TIME_WINDOW_MINUTES']
+    except ValueError as e:
         return jsonify({
             'status': 'error',
-            'message': 'Amount must be a number and time_window must be integer'
+            'message': f'Invalid input: {str(e)}'
         }), 400
     
     try:
@@ -691,6 +694,7 @@ def debug_emails():
     try:
         mail = connect_imap()
         
+        # 🔥 Get last 50 emails for debugging
         result, data = mail.search(None, 'ALL')
         if result != 'OK':
             return jsonify({
@@ -710,31 +714,42 @@ def debug_emails():
         emails = []
         now = datetime.now()
         
-        for msg_id in email_ids[-20:]:
+        # 🔥 Check last 30 emails
+        for msg_id in email_ids[-30:]:
             msg_id_str = msg_id.decode('utf-8') if isinstance(msg_id, bytes) else str(msg_id)
             
             try:
                 body = get_email_body_from_imap(mail, msg_id_str)
                 details = parse_payment_email(body)
                 
-                within_5_min = False
+                # Get email date from header
+                result, data = mail.fetch(msg_id, '(BODY.PEEK[HEADER.FIELDS (DATE)])')
+                email_date_str = None
+                if result == 'OK':
+                    header_data = data[0][1].decode('utf-8', errors='ignore')
+                    date_match = re.search(r'Date:\s*(.+)', header_data, re.IGNORECASE)
+                    if date_match:
+                        email_date_str = date_match.group(1)
+                
                 time_ago = None
+                within_window = False
                 payment_time = details.get('payment_datetime')
                 if payment_time:
                     time_ago = (now - payment_time).total_seconds() / 60
-                    within_5_min = time_ago <= 5
+                    within_window = time_ago <= CONFIG['TIME_WINDOW_MINUTES']
                 
                 emails.append({
                     'id': msg_id_str,
+                    'email_date': email_date_str,
                     'amount_found': details.get('amount'),
                     'transaction_type': details.get('type'),
                     'transaction_id': details.get('transaction_id'),
                     'sender': details.get('sender'),
                     'payment_time': details.get('date'),
                     'minutes_ago': round(time_ago, 1) if time_ago is not None else None,
-                    'within_5_minutes': within_5_min,
+                    'within_time_window': within_window,
                     'is_received': details.get('type') == 'received',
-                    'body_preview': body[:150] if body else 'No body'
+                    'body_preview': body[:200] if body else 'No body'
                 })
             except Exception as e:
                 emails.append({
@@ -1016,20 +1031,20 @@ def index():
             'verify_payment': {
                 'method': 'POST/GET',
                 'path': '/verify-payment',
-                'params': {'amount': 'required', 'time_window': 'optional (default 5)'},
-                'example': '/verify-payment?amount=100&time_window=5'
+                'params': {'amount': 'required', 'time_window': 'optional (default 30)'},
+                'example': '/verify-payment?amount=100&time_window=30'
             },
             'verify_realtime': {
                 'method': 'GET',
                 'path': '/verify-realtime',
-                'params': {'amount': 'required', 'time_window': 'optional (default 5)'},
-                'example': '/verify-realtime?amount=100&time_window=5'
+                'params': {'amount': 'required', 'time_window': 'optional (default 30)'},
+                'example': '/verify-realtime?amount=100&time_window=30'
             },
             'verify_last_payment': {
                 'method': 'GET',
                 'path': '/verify-last-payment',
-                'params': {'amount': 'required', 'time_window': 'optional (default 5)'},
-                'example': '/verify-last-payment?amount=100&time_window=5',
+                'params': {'amount': 'required', 'time_window': 'optional (default 30)'},
+                'example': '/verify-last-payment?amount=100&time_window=30',
                 'description': '⚡ FASTEST - One-time check (under 1 second)'
             },
             'debug_emails': {
@@ -1073,7 +1088,7 @@ if __name__ == '__main__':
     logger.info(f"🔐 App Password: {CONFIG['GMAIL_APP_PASSWORD']}")
     logger.info(f"📱 UPI ID: {CONFIG['UPI_ID']}")
     logger.info(f"🏪 Payee: {CONFIG['PAYEE_NAME']}")
-    logger.info(f"⏰ Time Window: {CONFIG['TIME_WINDOW_MINUTES']} minutes")
+    logger.info(f"⏰ Time Window: {CONFIG['TIME_WINDOW_MINUTES']} minutes (DEFAULT)")
     logger.info(f"⚡ Poll Interval: {CONFIG['POLL_INTERVAL']} seconds (ULTRA FAST)")
     logger.info(f"🔄 Type: ONLY RECEIVED transactions")
     logger.info(f"🌐 Server: http://127.0.0.1:{CONFIG['PORT']}")
